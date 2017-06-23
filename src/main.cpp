@@ -91,41 +91,98 @@ int main() {
           double py = j[1]["y"];
           double psi = j[1]["psi"];
           double v = j[1]["speed"];
-
-          /*
-          * TODO: Calculate steering angle and throttle using MPC.
-          *
-          * Both are in between [-1, 1].
-          *
-          */
-          double steer_value;
-          double throttle_value;
+          double steer = j[1]["steering_angle"];
+          steer *= -1;
+          double throttle = j[1]["throttle"];
 
           json msgJson;
-          // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
-          // Otherwise the values will be in between [-deg2rad(25), deg2rad(25] instead of [-1, 1].
-          msgJson["steering_angle"] = steer_value;
-          msgJson["throttle"] = throttle_value;
 
-          //Display the MPC predicted trajectory 
-          vector<double> mpc_x_vals;
-          vector<double> mpc_y_vals;
-
-          //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
-          // the points in the simulator are connected by a Green line
-
-          msgJson["mpc_x"] = mpc_x_vals;
-          msgJson["mpc_y"] = mpc_y_vals;
-
-          //Display the waypoints/reference line
+          // Convert simulator waypoints to vehicle coordinate frame for mpc
+          // and visualization back in simulator.
           vector<double> next_x_vals;
           vector<double> next_y_vals;
 
           //.. add (x,y) points to list here, points are in reference to the vehicle's coordinate system
           // the points in the simulator are connected by a Yellow line
 
+          // Resize the empty vector appropriately
+          next_x_vals.resize(ptsx.size());
+          next_y_vals.resize(ptsy.size());
+
+          for (unsigned int i = 0; i < ptsx.size(); i++) {
+            double delta_x = ptsx[i] - px;
+            double delta_y = ptsy[i] - py;
+            // Transform world coordinates into vehicle coordinates
+            // [x,y]' = [cos(psi) sin(psi); -sin(psi) cos(psi)] * [delta_x, delta_y]'
+            next_x_vals[i] = (delta_x*cos(psi) + delta_y*sin(psi));
+            next_y_vals[i] = (-delta_x*sin(psi) + delta_y*cos(psi));
+            //std::cout << "next_x = " << next_x_vals[i] << ", next_y = " << next_y_vals[i] << std::endl;
+          }
+
+          // Send transformed waypoints back to simulator for visualization
           msgJson["next_x"] = next_x_vals;
           msgJson["next_y"] = next_y_vals;
+
+          // convert std::vector to Eigen::VectorXd
+          // Fit waypoints to a polynomial, 3rd order
+          Eigen::VectorXd ptsx_eigen = Eigen::VectorXd::Map(next_x_vals.data(), next_x_vals.size());
+          Eigen::VectorXd ptsy_eigen = Eigen::VectorXd::Map(next_y_vals.data(), next_y_vals.size());
+          //std::cout << "ptsx_eigen = " << ptsx_eigen << ", ptsy_eigen = " << ptsy_eigen << std::endl;
+          // used 4th order to be more stable through curves
+          auto coeffs = polyfit(ptsx_eigen, ptsy_eigen, 4);
+          // Initial cross track error
+          // The cross track error is calculated by evaluating at polynomial at x, f(x)
+          // and subtracting y. Because x and y are 0 due to coordinate transformation
+          // cte becomes:
+          // cte = polyeval(coeffs, 0) - 0 ==> coeffs[0]
+          double cte = coeffs[0];
+          // Due to the psi starting at 0, the orientation error is -f'(x).
+          // derivative of polyfit eq evaluated at x == 0 -> coeffs[1]
+          double epsi = -atan(coeffs[1]);
+
+          std::cout << "cte = " << cte << ", epsi = " << epsi << std::endl;
+
+          // State vector
+          Eigen::VectorXd state(6);
+
+          // Transformed all into vehicle coordinates, so x,y,psi are all zeroes for init.
+          px = 0.0;
+          py = 0.0;
+          psi = 0.0;
+
+          // Account for 100ms delay - using kinematics model to predict the "init" state after latency
+          double latency = 0.1;
+          px += v*latency; // Follow current direction, thus only x coordinates will change. Y stays unchanged.
+          psi += v*tan(steer)*latency/Lf;
+          cte += v*sin(epsi)*latency;
+          epsi += v*psi;
+          v += throttle*latency;
+
+          state << px, py, psi, v, cte, epsi;
+
+          // Call MPC
+          auto tmp_vars = mpc.Solve(state, coeffs);
+          double steer_value = tmp_vars[0];
+          double throttle_value = tmp_vars[1];
+
+          std::cout << "steer_value = " << steer_value/deg2rad(25) << ", throttle_value = " << throttle_value << std::endl;
+
+          // NOTE: Remember to divide by deg2rad(25) before you send the steering value back.
+          // Otherwise the values will be in between [-deg2rad(25), deg2rad(25] instead of [-1, 1].
+
+          // Not sure why when 100ms latency added, the normalized version of steering will cause
+          // vehicle woblling from side to side
+          //msgJson["steering_angle"] = -steer_value/deg2rad(25);
+          msgJson["steering_angle"] = -steer_value;
+          msgJson["throttle"] = throttle_value;
+
+
+          //Display the MPC predicted trajectory
+          vector<double> mpc_x_vals = mpc.mpc_x_vals;
+          vector<double> mpc_y_vals = mpc.mpc_y_vals;
+
+          msgJson["mpc_x"] = mpc_x_vals;
+          msgJson["mpc_y"] = mpc_y_vals;
 
 
           auto msg = "42[\"steer\"," + msgJson.dump() + "]";
